@@ -921,8 +921,28 @@ private:
         // For context self-attention without prior KV cache, TRT-LLM passes
         // mMaxSeqLenKv=0. trtllm-gen requires mMaxSeqLenKv>0, so use mMaxSeqLenQ
         // as the effective KV length (Q produces KV of equal length).
-        options.mMaxSeqLenKv = (isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0) ? params.mMaxSeqLenQ
-                                                                                                 : params.mMaxSeqLenKv;
+        //
+        // For non-context kernels (MLA gen, generation FMHA, etc.), pin the
+        // kernel-selection mMaxSeqLenKv to the static mMaxSeqLenCacheKv
+        // (max_attention_window_size) so cubin selection stays invariant across
+        // iterations even when params.mMaxSeqLenKv (max_past_kv_length) changes.
+        // PR #14851 made mMaxSeqLenKv dynamic per-iteration in mlaGeneration,
+        // which caused 1-15 NVRTC re-compiles (7-9 s each) on the first prefill
+        // iterations and blew TTFT P99 from ~0.9 s to ~25 s on DeepSeek-R1
+        // FP8 8K1K. Per-sequence KV lengths are still passed via seqLensKvPtr,
+        // so kernel correctness is unaffected by this clamp.
+        if (isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0)
+        {
+            options.mMaxSeqLenKv = params.mMaxSeqLenQ;
+        }
+        else if (!isContextKernel(params.mKernelType) && params.mMaxSeqLenCacheKv > 0)
+        {
+            options.mMaxSeqLenKv = std::max(params.mMaxSeqLenKv, params.mMaxSeqLenCacheKv);
+        }
+        else
+        {
+            options.mMaxSeqLenKv = params.mMaxSeqLenKv;
+        }
         options.mMinSeqLenKv = options.mMaxSeqLenKv;
 
         // Variable sequence length support
