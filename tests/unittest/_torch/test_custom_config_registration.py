@@ -12,7 +12,9 @@ on GB200 — only runs in L0_PostMerge because it needs 12 GB200 GPUs across
 regressions.
 """
 
+import contextlib
 import json
+import sys
 
 import pytest
 from transformers import AutoConfig
@@ -153,3 +155,39 @@ def test_load_hf_model_config_uses_autoconfig_dispatch(tmp_path, model_type):
     assert cfg is not None
     assert isinstance(cfg, DeepseekV3Config)
     assert cfg.max_position_embeddings == 16384
+
+
+def test_benchmark_client_get_tokenizer_registers_custom_config(tmp_path, monkeypatch):
+    # The perf-sanity benchmark client (tensorrt_llm.serve.scripts.benchmark_serving) calls
+    # get_tokenizer before issuing any request, and its bare AutoTokenizer.from_pretrained needs
+    # CONFIG_MAPPING to know the checkpoint's model_type. That registration is an import side
+    # effect of tensorrt_llm._torch.configs, which stopped being guaranteed once
+    # `import tensorrt_llm` became lazy.
+    #
+    # The tests above cannot catch a regression here: importing this module already registered
+    # everything. Reproducing the client's starting state needs both the mapping entry dropped
+    # AND the configs module evicted from sys.modules -- otherwise get_tokenizer's import is a
+    # no-op that re-registers nothing, and the test would pass with the guard deleted.
+    #
+    # "cosmos3_omni" is the pre-rename alias, so no upstream transformers release can ever ship
+    # it. Registration is gap-filling ("if model_type in CONFIG_MAPPING: continue"), so asserting
+    # on a model_type that upstream might adopt would silently go vacuous on a dependency bump.
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from tensorrt_llm.serve.scripts.backend_request_func import get_tokenizer
+
+    model_type = "cosmos3_omni"
+    model_dir = tmp_path / model_type
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(_deepseek_min_config(model_type)))
+
+    monkeypatch.delitem(CONFIG_MAPPING._extra_content, model_type)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm._torch.configs")
+
+    # A synthetic checkpoint ships no tokenizer files, so the call itself cannot succeed; what
+    # matters is that resolving the config registered the model_type instead of falling back to
+    # a bare PreTrainedConfig.
+    with contextlib.suppress(Exception):
+        get_tokenizer(str(model_dir), tokenizer_mode="auto", trust_remote_code=True)
+
+    assert model_type in CONFIG_MAPPING

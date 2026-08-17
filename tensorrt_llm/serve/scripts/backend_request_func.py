@@ -445,6 +445,12 @@ def get_tokenizer(
             raise ValueError(
                 f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
                 "Expected alias or 'module.path.ClassName'.") from e
+    # AutoTokenizer resolves the checkpoint config first, and model_types such
+    # as deepseek_v32 are invisible to stock transformers; the registration is
+    # an import side effect of tensorrt_llm._torch.configs (previously
+    # guaranteed by the eager `import tensorrt_llm`).
+    import tensorrt_llm._torch.configs  # noqa: F401
+
     return AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path,
         trust_remote_code=trust_remote_code,
