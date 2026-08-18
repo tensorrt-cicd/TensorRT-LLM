@@ -225,7 +225,7 @@ class HfWeightLoader(BaseWeightLoader):
                     # Rank-local caches can diverge, so a hit on one rank must
                     # enqueue EXACTLY the collectives a miss on another rank
                     # enqueues, in the same order, or the job deadlocks. The
-                    # safetensors miss path performs an Allreduce (inside
+                    # eager checkpoint miss path performs an Allreduce (inside
                     # _get_local_available_host_memory) and then a Barrier;
                     # mirror both here (the allreduce result is unused).
                     self._get_local_available_host_memory()
@@ -317,7 +317,9 @@ class HfWeightLoader(BaseWeightLoader):
                 weight_files,
                 use_consolidated,
                 mirror_load_collectives=True,
-                load_fn=lambda: self._prefetch_and_load(weight_files))
+                load_fn=lambda: self._prefetch_and_load(
+                    weight_files, self._load_safetensors_file,
+                    "Loading safetensors weights in parallel"))
 
         weight_files = glob.glob(f"{checkpoint_dir}/*.bin")
         if not weight_files:
@@ -327,15 +329,15 @@ class HfWeightLoader(BaseWeightLoader):
             return self._with_weight_cache(
                 weight_files,
                 use_consolidated,
-                mirror_load_collectives=False,
-                load_fn=lambda: self._load_weights_in_parallel(
+                mirror_load_collectives=True,
+                load_fn=lambda: self._prefetch_and_load(
                     weight_files, self._load_bin_or_path_file,
                     "Loading bin weights in parallel"))
 
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
-    def _prefetch_and_load(self,
-                           weight_files: List[str]) -> ConsumableWeightsDict:
+    def _prefetch_and_load(self, weight_files: List[str], load_func,
+                           description: str) -> ConsumableWeightsDict:
         # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
         # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
         prefetch_size = sum(os.path.getsize(file) for file in weight_files)
@@ -357,9 +359,8 @@ class HfWeightLoader(BaseWeightLoader):
         # skipped. Ranks that didn't prefetch reach the barrier immediately.
         local_mpi_barrier()
 
-        return self._load_weights_in_parallel(
-            weight_files, self._load_safetensors_file,
-            "Loading safetensors weights in parallel")
+        return self._load_weights_in_parallel(weight_files, load_func,
+                                              description)
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
                                   description: str) -> ConsumableWeightsDict:
@@ -478,7 +479,7 @@ class HfWeightLoader(BaseWeightLoader):
 
     def prefetch_files(self, file_names: List[str]):
         """
-        Prefetch safetensors files to memory so that the weight loading will be much faster.
+        Prefetch checkpoint files to memory so that the weight loading will be much faster.
         When multiple ranks run in parallel, each rank will prefetch some files.
         """
         # Find out the files to prefetch for the current rank.

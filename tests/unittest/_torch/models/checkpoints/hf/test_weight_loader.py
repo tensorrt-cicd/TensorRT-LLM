@@ -127,6 +127,38 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
     assert set(loaded_weight_files) == expected_safetensor_filenames
 
 
+@pytest.mark.parametrize("weight_file_suffix", [".bin", ".pth"])
+def test_load_bin_or_pth_weights_prefetches_before_mmap_load(tmp_path, weight_file_suffix):
+    checkpoint_dir = tmp_path / "foo"
+    checkpoint_dir.mkdir()
+    weight_files = [
+        checkpoint_dir / f"model-1{weight_file_suffix}",
+        checkpoint_dir / f"model-2{weight_file_suffix}",
+    ]
+    for weight_file in weight_files:
+        weight_file.touch()
+
+    loader = HfWeightLoader()
+    with (
+        mock.patch.object(
+            loader, "_load_weights_in_parallel", side_effect=MyError
+        ) as load_weights_in_parallel,
+        mock.patch.object(loader, "prefetch_files") as prefetch_files,
+        pytest.raises(MyError),
+    ):
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+
+    expected_weight_files = {str(weight_file) for weight_file in weight_files}
+    prefetch_files.assert_called_once()
+    assert set(prefetch_files.call_args.args[0]) == expected_weight_files
+
+    load_weights_in_parallel.assert_called_once()
+    loaded_weight_files, load_func, description = load_weights_in_parallel.call_args.args
+    assert set(loaded_weight_files) == expected_weight_files
+    assert load_func is loader._load_bin_or_path_file
+    assert description == "Loading bin weights in parallel"
+
+
 def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path, monkeypatch):
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
 
@@ -256,7 +288,8 @@ def test_weight_cache_detects_inplace_mutation_and_reloads(tmp_path, monkeypatch
     assert torch.equal(second["a.weight"], torch.ones(64))  # clean weights
 
 
-def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
+@pytest.mark.parametrize("weight_file_suffix", [".safetensors", ".bin"])
+def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch, weight_file_suffix):
     # Rank-local caches can diverge, so a hit on one rank and a miss on
     # another must enqueue the SAME collectives in the same order (Allreduce
     # from _get_local_available_host_memory, then Barrier) or the job
@@ -265,7 +298,7 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
 
     checkpoint_dir = tmp_path / "foo"
     checkpoint_dir.mkdir()
-    (checkpoint_dir / "model.safetensors").touch()
+    (checkpoint_dir / f"model{weight_file_suffix}").touch()
 
     loader = HfWeightLoader()
     sequences = {"miss": [], "hit": []}
