@@ -187,6 +187,12 @@ __device__ __forceinline__ void s2gAllFields(
 {
     int offset = 0;
 
+    // protoUnpack restored payload words from several lanes through the generic
+    // proxy. Every lane fences its own writes, and the warp barrier orders lane
+    // 0's cp.async.bulk reads (and the next entry's G2S overwrite) after them.
+    tensorrt_llm::common::fence_view_async_shared();
+    __syncwarp();
+
     // Store field 0 (variable size half)
     s2gField(fieldInfo[0], dataIndex, shmemBase, offset, laneId);
     int field0Size = getFieldSize(fieldInfo[0]);
