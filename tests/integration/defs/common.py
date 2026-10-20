@@ -421,6 +421,24 @@ def get_static_port_range() -> Optional[tuple[int, int]]:
     return low, high
 
 
+def _port_answers_on_loopback(port: int) -> bool:
+    """Return True if a TCP connect to 127.0.0.1:<port> is accepted.
+
+    Call this while holding a bound, non-listening socket on the port: nothing
+    on this host can then be listening on it, so an accepted connection means
+    the host's packet filter redirects the port to some other server (e.g. a
+    Kubernetes NodePort). A server bound to such a port never receives its
+    clients' connections, so the port is not usable.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        try:
+            s.connect(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
 def reserve_port_from_range(port_range: tuple[int, int],
                             source: str) -> Optional[int]:
     """Probe-bind random ports from an inclusive (low, high) window.
@@ -445,14 +463,6 @@ def reserve_port_from_range(port_range: tuple[int, int],
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("localhost", port))
-                PORTS_IN_USE.add(port)
-                print_info(
-                    f"[get_free_port_in_ci] pid={pid} allocated port={port} "
-                    f"from {source} range {port_range} after {attempt} "
-                    f"attempt(s); {len(PORTS_IN_USE)} reserved in-process. The "
-                    f"probe socket is now closed, so another process may take "
-                    f"the port before the caller rebinds it (TOCTOU).")
-                return port
             except OSError as e:
                 print_info(
                     f"[get_free_port_in_ci] pid={pid} candidate port={port} "
@@ -460,6 +470,22 @@ def reserve_port_from_range(port_range: tuple[int, int],
                     f"another.")
                 available_ports.remove(port)
                 continue
+            if _port_answers_on_loopback(port):
+                print_info(
+                    f"[get_free_port_in_ci] pid={pid} candidate port={port} "
+                    f"in {source} range {port_range} can be bound, but a "
+                    f"connection to it is answered by another listener (the "
+                    f"host redirects it); trying another.")
+                available_ports.remove(port)
+                continue
+            PORTS_IN_USE.add(port)
+            print_info(
+                f"[get_free_port_in_ci] pid={pid} allocated port={port} "
+                f"from {source} range {port_range} after {attempt} "
+                f"attempt(s); {len(PORTS_IN_USE)} reserved in-process. The "
+                f"probe socket is now closed, so another process may take "
+                f"the port before the caller rebinds it (TOCTOU).")
+            return port
 
     print_warning(
         f"[get_free_port_in_ci] pid={pid} exhausted all {num_candidates} "
